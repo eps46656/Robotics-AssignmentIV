@@ -319,6 +319,9 @@ def main():
             center, phi = FindCL(obj_points)
             area = float(obj_points.shape[0])
 
+            # center[2]
+            # phi[]
+
             obj_centers[img_idx, obj_idx] = center
             obj_phis[img_idx, obj_idx] = phi
             obj_areas[img_idx, obj_idx] = area
@@ -346,7 +349,7 @@ def main():
         print(f"err = {err}")
 
 def main2():
-    N = 27
+    N = 5
 
     H, err = GetObjHomography(
         np.random.rand(N, 3), # locs[N, 3]
