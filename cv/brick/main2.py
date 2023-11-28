@@ -303,52 +303,135 @@ def UndistortImage(img, camera_mat, camera_distort):
 
     return undistorted_img
 
-def main3():
-    '''
-    model:
-        proj_area = K / distance^2
+def GetNormalizedMat(points, center, dist):
+    # points[P, N]
+    # center[P-1]
+    # dist
 
-    F:
-        z: the z param of robot arm
+    center = np.array(center)
 
-        proj_area = K / (C + M * z)^2
+    assert len(points.shape) == 2
+    assert points.shape[0] - 1 == center.shape[0]
 
-        merge K
+    P = points.shape[0]
 
-        C + M * z = sqrt(1 / proj_area)
+    origin = points.mean(1)[:-1]
 
-        denote xi = sqrt(1 / proj_area_i)
-        denote yi = z
+    odist = (((points[:-1, :] - origin.reshape([P-1, 1]))**2).sum(0)**0.5).mean()
 
-        modify the model for robustness
+    k = dist / odist
 
-        yi = c0 + c1 * xi + c2 * xi^2 + c3 * xi^3
+    ret = np.zeros([P, P])
 
-        linear regression to get c
+    for i in range(P-1):
+        ret[i, i] = k
 
-    when height estimating
-        est_z = (sqrt(real_area / proj_area) - C) / M
+    ret[-1, -1] = 1
 
-        cur_z: the current z param of robot arm
+    ret[:-1, -1] = center - origin * k
 
-        height = est_z - cur_z
-    '''
+    return ret
 
+def FindHomographic(src, dst):
+    # src[P, N]
+    # dst[Q, N]
+
+    assert len(src.shape) == 2
+    assert len(dst.shape) == 2
+    assert src.shape[1] == dst.shape[1]
+
+    P, N = src.shape
+    Q, _ = dst.shape
+
+    A = np.zeros([N*(Q-1), P*Q])
+
+    for i in range(N):
+        for j in range(Q-1):
+            A[(Q-1)*i+j, j*P:j*P+P] = src[:, i]
+            A[(Q-1)*i+j, -P:] = src[:, i] * -dst[j, i]
+
+    _, _, Vh = np.linalg.svd(A)
+
+    return Vh[-1, :].reshape([Q, P])
+
+def HomographyTrans(H, x):
+    assert len(H.shape) == 2
+    assert len(x.shape) == 2
+
+    ret = H @ x
+
+    P = ret.shape[0]
+
+    for i in range(P):
+        np.divide(ret[i, :], ret[-1, :], out=ret[i, :])
+
+    return ret
+
+def NormalizedDLT(points1, points2, normalized):
+    # points1[P, N]
+    # points2[Q, N]
+
+    assert len(points1.shape) == 2
+    assert len(points2.shape) == 2
+
+    P = points1.shape[0]
+    Q = points2.shape[0]
+
+    T1 = np.identity(P)
+    T2 = np.identity(Q)
+
+    if normalized:
+        T1 = GetNormalizedMat(points1, np.zeros([P-1]), np.sqrt(P-1))
+        T2 = GetNormalizedMat(points2, np.zeros([Q-1]), np.sqrt(Q-1))
+
+    rep_points1 = T1 @ points1
+    rep_points2 = T2 @ points2
+
+    H = FindHomographic(rep_points1, rep_points2) # [P, Q]
+
+    return np.linalg.inv(T2) @ H @ T1
+
+def GetObjHomography(obj_locs, obj_centers, obj_areas):
+    N = obj_locs.shape[0]
+
+    assert obj_locs.shape == (N, 3)
+    assert obj_centers.shape == (N, 2)
+    assert obj_areas.shape == (N,)
+
+    xs = np.empty((4, N))
+    ys = np.empty((4, N))
+
+    xs[0, :] = obj_centers[:, 0]
+    xs[1, :] = obj_centers[:, 1]
+    xs[2, :] = obj_areas**-0.5
+    xs[3, :] = 1
+
+    ys[0, :] = obj_locs[:, 0]
+    ys[1, :] = obj_locs[:, 1]
+    ys[2, :] = obj_locs[:, 2]
+    ys[3, :] = 1
+
+    H = NormalizedDLT(xs, ys, True) # [4, 4]
+
+    re_ys = H @ xs # [4, N]
+    re_ys /= re_ys[3, :]
+
+    err = (re_ys - ys)**2 # [4, N]
+    err = err.sum(axis=1) # [N]
+    err = err**0.5 # [N]
+    err = err.sum() # []
+
+    return H, err
+
+'''
+
+estimate the translation between current loc to obj loc
+
+'''
+
+def main():
     camera_mat, camera_distort = \
         ReadCameraParam(f"{DIR}/../camera_calib/camera_params.npy")
-
-    inv_camera_mat = np.linalg.inv(camera_mat)
-
-    img_filenames = [
-        f"{DIR}/images/img-430.png",
-        f"{DIR}/images/img-530.png",
-        f"{DIR}/images/img-630.png",
-        f"{DIR}/images/img-730.png",
-    ]
-
-    IMG_NUM = len(img_filenames)
-
-    zs = np.array([430, 530, 630, 730])
 
     obj_colors = np.array([
         [ 97,113,145], # blue
@@ -356,102 +439,77 @@ def main3():
         [181,210,124], # green
     ])
 
-    anno_colors = np.concatenate([[[0, 0, 0]], obj_colors],
-                                 axis=0).astype(np.uint8)
+    IMG_NUM = 12
+    H = 1280 # TODO: this parameter should be modified
+    W = 960 # TODO: this parameter should be modified
 
     OBJ_NUM = obj_colors.shape[0]
 
-    anno_to_obj_color_r = np.vectorize(
-        lambda anno: anno_colors[anno][0], otypes=[np.uint8])
-    anno_to_obj_color_g = np.vectorize(
-        lambda anno: anno_colors[anno][1], otypes=[np.uint8])
-    anno_to_obj_color_b = np.vectorize(
-        lambda anno: anno_colors[anno][2], otypes=[np.uint8])
+    img_locs = np.empty((IMG_NUM, 3))
+    # TODO: locations denote where these image are captured
 
+    imgs = np.empty((IMG_NUM, H, W, 3))
+    # TODO: images in rgb
+
+    obj_locs = np.empty((IMG_NUM, OBJ_NUM, 3))
+    # TODO: obj position for each images, each objects
+
+    imgs = np.stack([
+        UndistortImage(img, camera_mat, camera_distort) for img in imgs
+    ], axis=0)
+
+    obj_centers = np.empty((IMG_NUM, OBJ_NUM, 2))
+    obj_phis = np.empty((IMG_NUM, OBJ_NUM, 2))
     obj_areas = np.empty((IMG_NUM, OBJ_NUM))
 
     for img_idx in range(IMG_NUM):
-        print(f"img_idx = {img_idx}")
-
-        img_filename = img_filenames[img_idx]
-
-        print(f"img_filename = {img_filename}")
-
-        img = cv.cvtColor(cv.imread(img_filenames[img_idx]),
-                          cv.COLOR_BGR2RGB)
-
-        img = UndistortImage(img, camera_mat, camera_distort)
-
-        assert len(img.shape) == 3
-        assert img.shape[2] == 3
+        img = imgs[img_idx]
 
         obj_anno = AnnoObjWithColorSim(img, obj_colors)
-
-        anno_img = np.stack([
-            anno_to_obj_color_r(obj_anno),
-            anno_to_obj_color_g(obj_anno),
-            anno_to_obj_color_b(obj_anno),
-        ], axis=2)
 
         for obj_idx in range(OBJ_NUM):
             obj_points = np.stack(np.where(obj_anno == obj_idx + 1), axis=-1)
 
+            center, phi = FindCL(obj_points)
             area = float(obj_points.shape[0])
 
-            center, phi = FindCL(obj_points)
-
+            obj_centers[img_idx, obj_idx] = center
+            obj_phis[img_idx, obj_idx] = phi
             obj_areas[img_idx, obj_idx] = area
 
-            print(f"obj_idx {obj_idx}: center = {center} phi = {phi} area = {area}")
+    # x = [obj_center_x,
+    #      obj_center_y,
+    #      obj_area**-0.5,
+    #      1]^T
 
-            DrawLine(anno_img, center, phi, [255, 255, 255])
-
-            cv.circle(anno_img,
-                      (int(round(center[1])), int(round(center[0]))),
-                      3, [255, 0, 0], -1)
-
-        '''
-        cv.imshow(f"anno {img_filename}",
-                  cv.cvtColor(anno_img, cv.COLOR_RGB2BGR))
-        cv.waitKey(0)
-        '''
+    # y = [obj_pos_x - img_loc_x,
+    #      obj_pos_y - img_loc_y,
+    #      obj_pos_z - img_loc_z,
+    #      1]^T
 
     for obj_idx in range(OBJ_NUM):
         print(f"obj_idx = {obj_idx}")
 
-        xs = obj_areas[:, obj_idx]**-0.5
-        ys = zs.reshape((IMG_NUM, 1))
+        H, err = GetObjHomography(
+            obj_locs[:, obj_idx, :] - img_locs, # [N, 3]
+            obj_centers[:, obj_idx, :], # [N, 2]
+            obj_areas[:, obj_idx], # [N]
+        )
 
-        K = len(xs)
+        print(f"H =\n{H}")
+        print(f"err = {err}")
 
-        A = list()
+def main2():
+    N = 27
 
-        A.append(np.ones((K,)))
-        A.append(xs)
+    H, err = GetObjHomography(
+        np.random.rand(N, 3), # locs[N, 3]
+        np.random.rand(N, 2), # centers[N, 2]
+        np.random.rand(N), # areas[N]
+    )
 
-        A = np.stack(A, axis=-1)
-
-        cs, res = np.linalg.lstsq(A, ys)[:2]
-
-        res = ((A @ cs - ys)**2).sum()
-
-        print(f"cs =\n{cs}")
-        print(f"res = {res}")
-        print(f"rms = {(res / K)**0.5}")
-
-def main4():
-    camera_mat, camera_distort = \
-        ReadCameraParam(f"{DIR}/../camera_calib/camera_params.npy")
-
-    inv_camera_mat = np.linalg.inv(camera_mat)
-
-    obj_colors = np.array([
-        [ 97,113,145], # blue
-        [254,224, 38], # yellow
-        [181,210,124], # green
-    ])
-
-    obj_anno = AnnoObjWithColorSim(img, obj_colors)
+    print(f"H =\n{H}")
+    print(f"err = {err}")
 
 if __name__ == "__main__":
-    main3()
+    main2()
