@@ -147,147 +147,6 @@ def GetCos(u, v):
 def GetAng(u, v):
     return np.arccos(GetCos(u, v))
 
-def LocateObj(img, camera_mat, camera_distort, cur_t,
-              obj_colors, obj_heights, obj_z_estor):
-    # img[H, W, 3] rgb
-    # camera_mat[3, 4]
-    # camera_distort
-    # cur_t [3] current position of robot (x, y, z)
-    # obj_colors [OBJ_NUM, 3] rgb
-    # obj_z_estor [func(project_area)]
-
-    fine_z_to_grab_on_table = 230
-
-    assert len(img.shape) == 3
-    assert img.shape[2] == 3
-
-    OBJ_NUM = obj_colors.shape[0]
-
-    assert obj_colors.shape == (OBJ_NUM, 3)
-    assert obj_heights.shape == (OBJ_NUM,)
-    assert len(obj_z_estor) == OBJ_NUM
-
-    img = UndistortImage(img, camera_mat, camera_distort)
-
-    obj_anno = AnnoObjWithColorSim(img, obj_colors)
-
-    obj_areas = np.empty((OBJ_NUM,))
-    obj_centers = np.empty((OBJ_NUM, 2))
-    obj_phis = np.empty((OBJ_NUM,))
-
-    obj_pos = np.empty((OBJ_NUM, 3))
-
-    cur_z = cur_t[2]
-
-    for obj_idx in range(OBJ_NUM):
-        obj_points = np.stack(np.where(obj_anno == obj_idx + 1), axis=-1)
-
-        area = float(obj_points.shape[0])
-
-        center, phi = FindCL(obj_points)
-
-        obj_areas[obj_idx] = area
-        obj_centers[obj_idx] = center
-        obj_phis[obj_idx] = phi
-
-        est_z = obj_z_estor(area)
-        # at
-
-        height = est_z - cur_z
-
-        obj_pos[obj_idx, 2] = fine_z_to_grab_on_table + height
-
-        pass
-
-    #
-
-def main():
-    img = cv.cvtColor(cv.imread(f"{DIR}/images/img-730.png"), cv.COLOR_BGR2RGB)
-
-    print(img.shape)
-
-    obj_colors = np.array([
-        [254,224, 38], # yellow
-        [ 97,113,145], # blue
-        [181,210,124], # green
-    ])
-
-    obj_anno = AnnoObjWithColorSim(img, obj_colors)
-
-    H, W = img.shape[:2]
-
-    anno_colors = np.array([
-        [0, 0, 0],
-        obj_colors[0, :],
-        obj_colors[1, :],
-        obj_colors[2, :],
-    ], dtype=np.uint8)
-
-    img_ = anno_colors[obj_anno]
-
-    for obj_i, obj_color in enumerate(obj_colors):
-        obj_points = np.stack(np.where(obj_anno == obj_i + 1), axis=-1)
-
-        center, phi = FindCL(obj_points)
-
-        print(f"obj {obj_i}: center = {center} phi = {phi}")
-
-        DrawLine(img_, center, phi, [255, 255, 255])
-
-        cv.circle(img_,
-                  (int(round(center[1])), int(round(center[0]))),
-                   3, [127, 127, 127], -1)
-
-    cv.imshow("img", cv.cvtColor(img_, cv.COLOR_RGB2BGR))
-    cv.waitKey(0)
-
-def main2():
-    img = cv.cvtColor(cv.imread(f"{DIR}/images/img-430.png"), cv.COLOR_BGR2RGB)
-
-    obj_colors = np.array([
-        [254,224, 38], # yellow
-        [ 97,113,145], # blue
-        [181,210,124], # green
-    ])
-
-    N = len(obj_colors)
-
-    obj_anno = AnnoObjWithColorSim(img, obj_colors)
-
-    H, W = img.shape[:2]
-
-    camera_mat, camera_distort = \
-        ReadCameraParam(f"{DIR}/../camera_calib/camera_params.npy")
-
-    inv_camera_mat = np.linalg.inv(camera_mat)
-
-    obj_areas = np.empty((N,))
-    obj_centers = np.empty((N, 2))
-    obj_phis = np.empty((N,))
-
-    for obj_idx in range(N):
-        obj_points = np.stack(np.where(obj_anno == obj_idx + 1), axis=-1)
-
-        obj_area = float(obj_points.shape[0])
-        obj_center, obj_phi = FindCL(obj_points)
-
-        obj_areas[obj_idx] = obj_area
-        obj_centers[obj_idx] = obj_center
-        obj_phis[obj_idx] = obj_phi
-
-    obj_area_coeffs = list()
-
-    for obj_idx in range(N):
-        obj_center = obj_centers[obj_idx]
-        obj_center = np.array([[obj_center[0]], [obj_center[1]], [1]])
-
-        obj_area_coeffs.append(
-            GetCos(inv_camera_mat @ obj_center,
-                   np.array([[0], [0], [1]])))
-
-    # print(obj_area_coeffs)
-    print(obj_areas**0.5)
-
 def UndistortImage(img, camera_mat, camera_distort):
     H, W = img.shape[:2]
 
@@ -317,7 +176,7 @@ def GetNormalizedMat(points, center, dist):
 
     origin = points.mean(1)[:-1]
 
-    odist = (((points[:-1, :] - origin.reshape([P-1, 1]))**2).sum(0)**0.5).mean()
+    odist = (((points[:-1, :] - origin.reshape((P-1, 1)))**2).sum(0)**0.5).mean()
 
     k = dist / odist
 
@@ -352,20 +211,7 @@ def FindHomographic(src, dst):
 
     _, _, Vh = np.linalg.svd(A)
 
-    return Vh[-1, :].reshape([Q, P])
-
-def HomographyTrans(H, x):
-    assert len(H.shape) == 2
-    assert len(x.shape) == 2
-
-    ret = H @ x
-
-    P = ret.shape[0]
-
-    for i in range(P):
-        np.divide(ret[i, :], ret[-1, :], out=ret[i, :])
-
-    return ret
+    return Vh[-1, :].reshape((Q, P))
 
 def NormalizedDLT(points1, points2, normalized):
     # points1[P, N]
@@ -387,7 +233,7 @@ def NormalizedDLT(points1, points2, normalized):
     rep_points1 = T1 @ points1
     rep_points2 = T2 @ points2
 
-    H = FindHomographic(rep_points1, rep_points2) # [P, Q]
+    H = FindHomographic(rep_points1, rep_points2) # [Q, P]
 
     return np.linalg.inv(T2) @ H @ T1
 
@@ -417,7 +263,7 @@ def GetObjHomography(obj_locs, obj_centers, obj_areas):
     re_ys /= re_ys[3, :]
 
     err = (re_ys - ys)**2 # [4, N]
-    err = err.sum(axis=1) # [N]
+    err = err.sum(axis=0) # [N]
     err = err**0.5 # [N]
     err = err.sum() # []
 
