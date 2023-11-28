@@ -162,118 +162,66 @@ def UndistortImage(img, camera_mat, camera_distort):
 
     return undistorted_img
 
-def GetNormalizedMat(points, center, dist):
-    # points[P, N]
-    # center[P-1]
-    # dist
-
-    center = np.array(center)
-
-    assert len(points.shape) == 2
-    assert points.shape[0] - 1 == center.shape[0]
-
-    P = points.shape[0]
-
-    origin = points.mean(1)[:-1]
-
-    odist = (((points[:-1, :] - origin.reshape((P-1, 1)))**2).sum(0)**0.5).mean()
-
-    k = dist / odist
-
-    ret = np.zeros([P, P])
-
-    for i in range(P-1):
-        ret[i, i] = k
-
-    ret[-1, -1] = 1
-
-    ret[:-1, -1] = center - origin * k
-
-    return ret
-
-def FindHomographic(src, dst):
-    # src[P, N]
-    # dst[Q, N]
-
-    assert len(src.shape) == 2
-    assert len(dst.shape) == 2
-    assert src.shape[1] == dst.shape[1]
-
-    P, N = src.shape
-    Q, _ = dst.shape
-
-    A = np.zeros([N*(Q-1), P*Q])
-
-    for i in range(N):
-        for j in range(Q-1):
-            A[(Q-1)*i+j, j*P:j*P+P] = src[:, i]
-            A[(Q-1)*i+j, -P:] = src[:, i] * -dst[j, i]
-
-    _, _, Vh = np.linalg.svd(A)
-
-    return Vh[-1, :].reshape((Q, P))
-
-def NormalizedDLT(points1, points2, normalized):
+def SolveM(points1, points2):
     # points1[P, N]
     # points2[Q, N]
+    # points2 = M @ points1
 
     assert len(points1.shape) == 2
     assert len(points2.shape) == 2
 
-    P = points1.shape[0]
+    P, N = points1.shape
     Q = points2.shape[0]
 
-    T1 = np.identity(P)
-    T2 = np.identity(Q)
+    assert points2.shape == (Q, N)
 
-    if normalized:
-        T1 = GetNormalizedMat(points1, np.zeros([P-1]), np.sqrt(P-1))
-        T2 = GetNormalizedMat(points2, np.zeros([Q-1]), np.sqrt(Q-1))
+    A = np.zeros((Q*N, P*Q))
 
-    rep_points1 = T1 @ points1
-    rep_points2 = T2 @ points2
+    for n in range(N):
+        for q in range(Q):
+            A[Q*n+q, P*q:P*(q+1)] = points1[:, n]
 
-    H = FindHomographic(rep_points1, rep_points2) # [Q, P]
+    # A @ m = points2
 
-    return np.linalg.inv(T2) @ H @ T1
+    m, res = np.linalg.lstsq(
+        A, points2.transpose().reshape((Q*N, 1)), rcond=None)[:2]
 
-def GetObjHomography(obj_locs, obj_centers, obj_areas):
-    N = obj_locs.shape[0]
+    M = m.reshape((Q, P))
 
-    assert obj_locs.shape == (N, 3)
+    return M
+
+def GetObjM(T_base_to_gripper, obj_base_locs, obj_centers, obj_areas):
+    # T_base_to_gripper[N, 4, 4]
+    # obj_base_locs[N, 3]
+    # obj_centers[N, 2]
+    # obj_areas[N]
+
+    N = obj_base_locs.shape[0]
+
+    assert T_base_to_gripper.shape == (N, 4, 4)
+    assert obj_base_locs.shape == (N, 3)
     assert obj_centers.shape == (N, 2)
     assert obj_areas.shape == (N,)
 
-    xs = np.empty((4, N))
-    ys = np.empty((4, N))
+    tmp = np.empty((N, 4, 1))
+    tmp[:, :3, 0] = obj_base_locs
+    tmp[:, 3, 0] = 1
 
-    xs[0, :] = obj_centers[:, 0]
-    xs[1, :] = obj_centers[:, 1]
-    xs[2, :] = obj_areas**-0.5
-    xs[3, :] = 1
+    obj_gripper_locs = T_base_to_gripper @ tmp # [N, 4, 1]
+    obj_gripper_locs = obj_gripper_locs.reshape((N, 4)).transpose() # [4, N]
 
-    ys[0, :] = obj_locs[:, 0]
-    ys[1, :] = obj_locs[:, 1]
-    ys[2, :] = obj_locs[:, 2]
-    ys[3, :] = 1
+    rsqrt_obj_areas = obj_areas**-0.5 # [N]
 
-    H = NormalizedDLT(xs, ys, True) # [4, 4]
+    obj_camera_locs = np.stack([
+        obj_centers[:, 0] * rsqrt_obj_areas,
+        obj_centers[:, 0] * rsqrt_obj_areas,
+        rsqrt_obj_areas,
+        np.ones((N,))
+    ], axis=0) # [4, N]
 
-    re_ys = H @ xs # [4, N]
-    re_ys /= re_ys[3, :]
+    M = SolveM(obj_camera_locs, obj_gripper_locs) # [4, 4]
 
-    err = (re_ys - ys)**2 # [4, N]
-    err = err.sum(axis=0) # [N]
-    err = err**0.5 # [N]
-    err = err.sum() # []
-
-    return H, err
-
-'''
-
-estimate the translation between current loc to obj loc
-
-'''
+    return M
 
 def main():
     camera_mat, camera_distort = \
@@ -291,8 +239,8 @@ def main():
 
     OBJ_NUM = obj_colors.shape[0]
 
-    img_locs = np.empty((IMG_NUM, 3))
-    # TODO: locations denote where these image are captured
+    Ts_base_to_gripper = np.empty((IMG_NUM, 4, 4))
+    # TODO: transformations from base to gripper for each image
 
     imgs = np.empty((IMG_NUM, H, W, 3))
     # TODO: images in rgb
@@ -300,65 +248,66 @@ def main():
     obj_locs = np.empty((IMG_NUM, OBJ_NUM, 3))
     # TODO: obj position for each images, each objects
 
-    imgs = np.stack([
-        UndistortImage(img, camera_mat, camera_distort) for img in imgs
-    ], axis=0)
-
     obj_centers = np.empty((IMG_NUM, OBJ_NUM, 2))
     obj_phis = np.empty((IMG_NUM, OBJ_NUM, 2))
     obj_areas = np.empty((IMG_NUM, OBJ_NUM))
 
     for img_idx in range(IMG_NUM):
-        img = imgs[img_idx]
+        img = UndistortImage(imgs[img_idx], camera_mat, camera_distort)
 
         obj_anno = AnnoObjWithColorSim(img, obj_colors)
 
         for obj_idx in range(OBJ_NUM):
             obj_points = np.stack(np.where(obj_anno == obj_idx + 1), axis=-1)
 
-            center, phi = FindCL(obj_points)
-            area = float(obj_points.shape[0])
-
-            # center[2]
-            # phi[]
+            center, phi = FindCL(obj_points) # [2], []
+            area = float(obj_points.shape[0]) # [1]
 
             obj_centers[img_idx, obj_idx] = center
             obj_phis[img_idx, obj_idx] = phi
             obj_areas[img_idx, obj_idx] = area
 
-    # x = [obj_center_x,
-    #      obj_center_y,
-    #      obj_area**-0.5,
-    #      1]^T
-
-    # y = [obj_pos_x - img_loc_x,
-    #      obj_pos_y - img_loc_y,
-    #      obj_pos_z - img_loc_z,
-    #      1]^T
+    obj_Ms = np.empty((OBJ_NUM, 4, 4))
 
     for obj_idx in range(OBJ_NUM):
         print(f"obj_idx = {obj_idx}")
 
-        H, err = GetObjHomography(
-            obj_locs[:, obj_idx, :] - img_locs, # [N, 3]
-            obj_centers[:, obj_idx, :], # [N, 2]
-            obj_areas[:, obj_idx], # [N]
+        obj_M = GetObjM(
+            Ts_base_to_gripper, # [IMG_NUM, 4, 4]
+            obj_locs[:, obj_idx, :], # [IMG_NUM, 3]
+            obj_centers[:, obj_idx, :], # [IMG_NUM, 2]
+            obj_areas[:, obj_idx], # [IMG_NUM]
         )
 
-        print(f"H =\n{H}")
-        print(f"err = {err}")
+        assert obj_M.shape == (4, 4)
 
-def main2():
-    N = 5
+        obj_Ms[obj_idx] = obj_M
 
-    H, err = GetObjHomography(
-        np.random.rand(N, 3), # locs[N, 3]
-        np.random.rand(N, 2), # centers[N, 2]
-        np.random.rand(N), # areas[N]
-    )
+        print(f"obj_M =\n{obj_M}")
 
-    print(f"H =\n{H}")
+def TestSolveM():
+    P = 7
+    Q = 7
+    N = 128
+    sigma = 3
+
+    M = np.random.rand(Q, P) * 64
+
+    points1 = np.random.rand(P, N) * 64
+    points2 = M @ points1 + sigma * np.random.rand(Q, N)
+
+    pr_M = SolveM(points1, points2)
+
+    assert pr_M.shape == M.shape
+
+    pr_points2 = pr_M @ points1
+
+    err = (pr_points2 - points2)**2 # [Q, N]
+    err = err.sum(axis=0) # [N]
+    err = err**0.5 # [N]
+    err = err.mean() # []
+
     print(f"err = {err}")
 
 if __name__ == "__main__":
-    main2()
+    TestSolveM()
