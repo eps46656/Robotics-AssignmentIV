@@ -162,10 +162,80 @@ def UndistortImage(img, camera_mat, camera_distort):
 
     return undistorted_img
 
+def FindObjs(img, obj_colors):
+    # obj_colors[OBJ_NUM, 3]
+
+    assert len(obj_colors.shape) == 2
+
+    OBJ_NUM = obj_colors.shape[0]
+
+    obj_founds = np.empty((OBJ_NUM,), dtype=np.bool_)
+    obj_centers = np.empty((OBJ_NUM, 2))
+    obj_phis = np.empty((OBJ_NUM, 2))
+    obj_areas = np.empty((OBJ_NUM,))
+
+    obj_anno = AnnoObjWithColorSim(img, obj_colors)
+
+    for obj_idx in range(OBJ_NUM):
+        obj_points = np.stack(np.where(obj_anno == obj_idx + 1), axis=-1)
+
+        center, phi = FindCL(obj_points) # [2], []
+        area = float(obj_points.shape[0]) # [1]
+
+        if area == 0:
+            obj_founds[obj_idx] = False
+            continue
+
+        obj_founds[obj_idx] = True
+        obj_centers[obj_idx] = center
+        obj_phis[obj_idx] = phi
+        obj_areas[obj_idx] = area
+
+    return obj_founds, obj_centers, obj_phis, obj_areas
+
+def GetNormalizeMat(points, center, radius):
+    # points[N, P]
+    # center[P]
+    # radius[]
+
+    center = np.array(center)
+    radius = np.array(radius)
+
+    assert len(points.shape) == 2
+    assert center.shape == (points.shape[1],)
+    assert len(radius.shape) == 0
+
+    origin_center = points.mean(axis=0) # [P]
+
+    tmp = points - origin_center # [N, P]
+    tmp = tmp**2 # [N, P]
+    tmp = tmp.sum(axis=1) # [N]
+    tmp = tmp**0.5 # [N]
+    origin_radius = tmp.mean() # []
+
+    ratio = radius / origin_radius
+
+    return \
+        np.array([
+            [1, 0, 0, origin_center[0]],
+            [0, 1, 0, origin_center[1]],
+            [0, 0, 1, origin_center[2]],
+            [0, 0, 0,                1],]) @ \
+        np.array([
+            [ratio,     0,     0, 0],
+            [    0, ratio,     0, 0],
+            [    0,     0, ratio, 0],
+            [    0,     0,     0, 1],]) @ \
+        np.array([
+            [1, 0, 0, -center[0]],
+            [0, 1, 0, -center[1]],
+            [0, 0, 1, -center[2]],
+            [0, 0, 0,          1],])
+
 def SolveM(points1, points2):
     # points1[P, N]
     # points2[Q, N]
-    # points2 = M @ points1
+    # M @ points1 = points2
 
     assert len(points1.shape) == 2
     assert len(points2.shape) == 2
@@ -175,18 +245,17 @@ def SolveM(points1, points2):
 
     assert points2.shape == (Q, N)
 
-    A = np.zeros((Q*N, P*Q))
+    points1 = points1.transpose()
 
-    for n in range(N):
-        for q in range(Q):
-            A[Q*n+q, P*q:P*(q+1)] = points1[:, n]
+    A = np.empty((Q*N, Q*P))
 
-    # A @ m = points2
+    for i in range(Q):
+        for j in range(Q):
+            A[N*i:N*(i+1), P*j:P*(j+1)] = points1 if i == j else 0
 
-    m, res = np.linalg.lstsq(
-        A, points2.transpose().reshape((Q*N, 1)), rcond=None)[:2]
+    M, res = np.linalg.lstsq(A, points2.reshape((Q*N, 1)), rcond=None)[:2]
 
-    M = m.reshape((Q, P))
+    M = M.reshape((Q, P))
 
     return M
 
@@ -212,12 +281,11 @@ def GetObjM(T_base_to_gripper, obj_base_locs, obj_centers, obj_areas):
 
     rsqrt_obj_areas = obj_areas**-0.5 # [N]
 
-    obj_camera_locs = np.stack([
-        obj_centers[:, 0] * rsqrt_obj_areas,
-        obj_centers[:, 0] * rsqrt_obj_areas,
-        rsqrt_obj_areas,
-        np.ones((N,))
-    ], axis=0) # [4, N]
+    obj_camera_locs = np.empty((4,N))
+    obj_camera_locs[0, :] = obj_centers[:, 1] * rsqrt_obj_areas
+    obj_camera_locs[1, :] = obj_centers[:, 0] * rsqrt_obj_areas
+    obj_camera_locs[2, :] = rsqrt_obj_areas
+    obj_camera_locs[3, :] = 1
 
     M = SolveM(obj_camera_locs, obj_gripper_locs) # [4, 4]
 
@@ -285,11 +353,55 @@ def main():
 
         print(f"obj_M =\n{obj_M}")
 
+def Inference(img):
+    OBJ_NUM = 3
+
+    camera_mat, camera_distort = \
+        ReadCameraParam(f"{DIR}/../camera_calib/camera_params.npy")
+
+    obj_colors = np.array([
+        [ 97,113,145], # blue
+        [254,224, 38], # yellow
+        [181,210,124], # green
+    ])
+
+    obj_Ms = np.empty((OBJ_NUM, 4, 4))
+
+    T_base_to_gripper = np.empty((4, 4))
+
+    img = UndistortImage(img, camera_mat, camera_distort)
+
+    obj_founds, obj_centers, obj_phis, obj_areas = FindObjs(img, obj_colors)
+    # obj_founds[OBJ_NUM] boolean
+    # obj_centers[OBJ_NUM, 2] float
+    # obj_phis[OBJ_NUM] float
+    # obj_areas[OBJ_NUM] float
+
+    obj_centers = cv.undistortPoints(
+        obj_centers, camera_mat, camera_distort, None, camera_mat) \
+        .reshape((OBJ_NUM, 2))
+
+    rsqrt_obj_areas = obj_areas**-0.5
+
+    obj_camera_locs = np.empty((OBJ_NUM, 4, 1))
+    obj_camera_locs[:, 0, 0] = obj_centers[:, 1] * rsqrt_obj_areas
+    obj_camera_locs[:, 1, 0] = obj_centers[:, 0] * rsqrt_obj_areas
+    obj_camera_locs[:, 2, 0] = rsqrt_obj_areas
+    obj_camera_locs[:, 3, 0] = 1
+
+    tmp = obj_Ms @ obj_camera_locs # [OBJ_NUM, 4, 1]
+    tmp = np.linalg.inv(T_base_to_gripper) @ tmp # [OBJ_NUM, 4, 1]
+
+    obj_locs = tmp[:, :3, 0] # [OBJ_NUM, 3]
+
+    print("obj_locs =\n")
+    print(obj_locs)
+
 def TestSolveM():
     P = 7
-    Q = 7
+    Q = 5
     N = 128
-    sigma = 3
+    sigma = 2
 
     M = np.random.rand(Q, P) * 64
 
