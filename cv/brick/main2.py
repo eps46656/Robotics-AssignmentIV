@@ -353,6 +353,69 @@ def main():
 
         print(f"obj_M =\n{obj_M}")
 
+def Regress():
+    camera_mat, camera_distort = \
+        ReadCameraParam(f"{DIR}/../camera_calib/camera_params.npy")
+
+    obj_colors = np.array([
+        [ 97,113,145], # blue
+        [254,224, 38], # yellow
+        [181,210,124], # green
+    ])
+
+    IMG_NUM = 12
+    H = 1280 # TODO: this parameter should be modified
+    W = 960 # TODO: this parameter should be modified
+
+    OBJ_NUM = obj_colors.shape[0]
+
+    Ts_base_to_gripper = np.empty((IMG_NUM, 4, 4))
+    # TODO: transformations from base to gripper for each image
+
+    imgs = np.empty((IMG_NUM, H, W, 3))
+    # TODO: images in rgb
+
+    obj_locs = np.empty((IMG_NUM, OBJ_NUM, 3))
+    # TODO: obj position for each images, each objects
+
+    obj_centers = np.empty((IMG_NUM, OBJ_NUM, 2))
+    obj_phis = np.empty((IMG_NUM, OBJ_NUM, 2))
+    obj_areas = np.empty((IMG_NUM, OBJ_NUM))
+
+    for img_idx in range(IMG_NUM):
+        cur_obj_founds, cur_obj_centers, cur_obj_phis, cur_obj_areas = \
+            FindObjs(imgs[img_idx], obj_colors)
+        # cur_obj_founds[OBJ_NUM] boolean
+        # cur_obj_centers[OBJ_NUM, 2] float
+        # cur_obj_phis[OBJ_NUM] float
+        # cur_obj_areas[OBJ_NUM] float
+
+        cur_obj_centers = cv.undistortPoints(
+            cur_obj_centers, camera_mat, camera_distort, None, camera_mat) \
+            .reshape((OBJ_NUM, 2))
+
+        obj_centers[img_idx] = cur_obj_centers
+        obj_phis[img_idx] = cur_obj_phis
+        obj_areas[img_idx] = cur_obj_areas
+
+    obj_Ms = np.empty((OBJ_NUM, 4, 4))
+
+    for obj_idx in range(OBJ_NUM):
+        print(f"obj_idx = {obj_idx}")
+
+        obj_M = GetObjM(
+            Ts_base_to_gripper, # [IMG_NUM, 4, 4]
+            obj_locs[:, obj_idx, :], # [IMG_NUM, 3]
+            obj_centers[:, obj_idx, :], # [IMG_NUM, 2]
+            obj_areas[:, obj_idx], # [IMG_NUM]
+        )
+
+        assert obj_M.shape == (4, 4)
+
+        obj_Ms[obj_idx] = obj_M
+
+        print(f"obj_M =\n{obj_M}")
+
 def Inference(img):
     OBJ_NUM = 3
 
@@ -368,8 +431,6 @@ def Inference(img):
     obj_Ms = np.empty((OBJ_NUM, 4, 4))
 
     T_base_to_gripper = np.empty((4, 4))
-
-    img = UndistortImage(img, camera_mat, camera_distort)
 
     obj_founds, obj_centers, obj_phis, obj_areas = FindObjs(img, obj_colors)
     # obj_founds[OBJ_NUM] boolean
