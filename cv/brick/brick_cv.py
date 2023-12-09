@@ -1,3 +1,4 @@
+# 2023-1209-1620
 
 import cv2 as cv
 import math
@@ -9,6 +10,18 @@ DIR = os.path.dirname(__file__).replace("\\", "/")
 
 RAD_TO_DEG = 180 / math.pi
 DEG_TO_RAD = math.pi / 180
+
+def WriteImg(path, img):
+    cv.imwrite(path, cv.cvtColor(img, cv.COLOR_RGB2BGR))
+
+def ShowImg(title, img):
+    cv.imshow(title, cv.cvtColor(img, cv.COLOR_RGB2BGR))
+
+    while True:
+        if cv.waitKey(50) & 0xff == ord("q"):
+            break
+
+    cv.destroyWindow(title)
 
 def GetRotMat(x, y, z, theta):
     k = 1 / np.sqrt(x**2 + y**2 + z**2)
@@ -52,20 +65,21 @@ def AnnoObjWithColorSim(img, obj_colors):
     H, W = img.shape[:2]
     N = obj_colors.shape[0]
 
-    img = cv.medianBlur(img, 11)
+    img = cv.medianBlur(img, 7)
 
-    # cv.imshow("blur_frame", frame)
+    WriteImg(f"{DIR}/blur_img.png", img)
 
-    # cv.imwrite(f"{DIR}/blur_img.png", frame)
-
-    THRESHOLD = 60
-
-    dists = [np.full((H, W), THRESHOLD)]
+    dists = [np.full((H, W), float("inf"))]
 
     for obj_color in obj_colors:
         dists.append(np.abs(img - obj_color).max(axis=-1))
 
-    mark_img = np.stack(dists, axis=-1).argmin(axis=-1)
+    dark_mask = (127 <= img[:, :, 0]) | \
+                (127 <= img[:, :, 1]) | \
+                (127 <= img[:, :, 2])
+
+    mark_img = np.stack(dists, axis=-1).argmin(axis=-1) * \
+               dark_mask.astype(np.float64)
     mark_img, trans = SepImage(mark_img)
 
     assigned_obj_idx = set()
@@ -150,6 +164,8 @@ def DrawLine(img, center, phi, color):
     assert len(img.shape) == 3
     assert img.shape[2] == 3
 
+    color = [int(x) for x in color]
+
     c = math.cos(phi)
     s = math.sin(phi)
 
@@ -171,24 +187,11 @@ def DrawLine(img, center, phi, color):
 
     cv.line(img, k[0], k[1], color, 1)
 
-def ReadCameraParam(filename):
-    data = np.load(filename, allow_pickle=True).item()
-    camera_mat = data["camera_mat"]
-    camera_distort = data["camera_distort"]
+def NPSave(filename, data):
+    np.save(filename, data)
 
-    return camera_mat, camera_distort
-
-def ReadObjMs(filename):
-    data = np.load(filename, allow_pickle=True).item()
-    obj_Ms = data["obj_Ms"]
-
-    return obj_Ms
-
-def GetCos(u, v):
-    return (u*v).sum() / np.linalg.norm(u) / np.linalg.norm(v)
-
-def GetAng(u, v):
-    return np.arccos(GetCos(u, v))
+def NPLoad(filename):
+    return np.load(filename, allow_pickle=True).item()
 
 def UndistortImage(img, camera_mat, camera_distort):
     H, W = img.shape[:2]
@@ -217,9 +220,9 @@ def FindObjs(img, obj_colors):
     obj_phis = np.empty((OBJ_NUM,))
     obj_areas = np.empty((OBJ_NUM,))
 
-    obj_anno = AnnoObjWithColorSim(img, obj_colors)
+    obj_anno_map = AnnoObjWithColorSim(img, obj_colors)
 
-    if False:
+    if True:
         anno_colors = np.concatenate([[[0, 0, 0]], obj_colors],
                                     axis=0).astype(np.uint8)
 
@@ -231,21 +234,15 @@ def FindObjs(img, obj_colors):
             lambda anno: anno_colors[anno][2], otypes=[np.uint8])
 
         anno_img = np.stack([
-            anno_to_obj_color_r(obj_anno),
-            anno_to_obj_color_g(obj_anno),
-            anno_to_obj_color_b(obj_anno),
+            anno_to_obj_color_r(obj_anno_map),
+            anno_to_obj_color_g(obj_anno_map),
+            anno_to_obj_color_b(obj_anno_map),
         ], axis=2)
 
-        anno_frame = cv.cvtColor(anno_img, cv.COLOR_RGB2BGR)
-
-        cv.imshow("anno_frame", anno_frame)
-
-        while True:
-            if cv.waitKey(50) & 0xff == ord("q"):
-                break
+        WriteImg(f"{DIR}/anno_frame.png", anno_img)
 
     for obj_idx in range(OBJ_NUM):
-        obj_points = np.stack(np.where(obj_anno == obj_idx + 1), axis=-1)
+        obj_points = np.stack(np.where(obj_anno_map == obj_idx + 1), axis=-1)
 
         center, phi = FindCL(obj_points) # [2], []
         area = float(obj_points.shape[0]) # [1]
@@ -259,46 +256,35 @@ def FindObjs(img, obj_colors):
         obj_phis[obj_idx] = phi
         obj_areas[obj_idx] = area
 
-    return obj_founds, obj_centers, obj_phis, obj_areas
+    return obj_anno_map, obj_founds, obj_centers, obj_phis, obj_areas
 
-def GetNormalizeMat(points, center, radius):
-    # points[N, P]
-    # center[P]
-    # radius[]
+def ColorAnnoObjs(anno_colors, obj_anno_map):
+    # anno_colors[OBJ_NUM + 1, 3] uint8
+    # img[H, W]
 
-    center = np.array(center)
-    radius = np.array(radius)
+    anno_to_obj_color_r = np.vectorize(
+        lambda anno: anno_colors[anno][0], otypes=[np.uint8])
+    anno_to_obj_color_g = np.vectorize(
+        lambda anno: anno_colors[anno][1], otypes=[np.uint8])
+    anno_to_obj_color_b = np.vectorize(
+        lambda anno: anno_colors[anno][2], otypes=[np.uint8])
 
-    assert len(points.shape) == 2
-    assert center.shape == (points.shape[1],)
-    assert len(radius.shape) == 0
+    obj_anno_img = np.stack([
+        anno_to_obj_color_r(obj_anno_map),
+        anno_to_obj_color_g(obj_anno_map),
+        anno_to_obj_color_b(obj_anno_map),
+    ], axis=2)
 
-    origin_center = points.mean(axis=0) # [P]
+    return obj_anno_img
 
-    tmp = points - origin_center # [N, P]
-    tmp = tmp**2 # [N, P]
-    tmp = tmp.sum(axis=1) # [N]
-    tmp = tmp**0.5 # [N]
-    origin_radius = tmp.mean() # []
+def DrawCenterPhi(obj_color, img, center, phi):
+    DrawLine(img, center, phi, obj_color)
 
-    ratio = radius / origin_radius
+    circle_color = [int(255 - x) for x in obj_color]
 
-    return \
-        np.array([
-            [1, 0, 0, origin_center[0]],
-            [0, 1, 0, origin_center[1]],
-            [0, 0, 1, origin_center[2]],
-            [0, 0, 0,                1],]) @ \
-        np.array([
-            [ratio,     0,     0, 0],
-            [    0, ratio,     0, 0],
-            [    0,     0, ratio, 0],
-            [    0,     0,     0, 1],]) @ \
-        np.array([
-            [1, 0, 0, -center[0]],
-            [0, 1, 0, -center[1]],
-            [0, 0, 1, -center[2]],
-            [0, 0, 0,          1],])
+    cv.circle(img,
+              (int(round(center[1])), int(round(center[0]))),
+              3, circle_color, 1)
 
 def SolveM(points1, points2):
     # points1[P, N]
@@ -333,7 +319,7 @@ def GetObjM(T_base_to_gripper, obj_base_locs, obj_centers, obj_areas):
     # obj_centers[N, 2]
     # obj_areas[N]
 
-    N = obj_base_locs.shape[0]
+    N = T_base_to_gripper.shape[0]
 
     assert T_base_to_gripper.shape == (N, 4, 4)
     assert obj_base_locs.shape == (N, 3)
@@ -359,71 +345,10 @@ def GetObjM(T_base_to_gripper, obj_base_locs, obj_centers, obj_areas):
 
     return M
 
-def main():
-    camera_mat, camera_distort = \
-        ReadCameraParam(f"{DIR}/../camera_calib/camera_params.npy")
-
-    obj_colors = np.array([
-        [247, 189, 170], # red
-        [253, 254, 151], # yellow
-        [118, 156, 208], # blue
-    ])
-
-    IMG_NUM = 12
-    H = 1280 # TODO: this parameter should be modified
-    W = 960 # TODO: this parameter should be modified
-
-    OBJ_NUM = obj_colors.shape[0]
-
-    Ts_base_to_gripper = np.empty((IMG_NUM, 4, 4))
-    # TODO: transformations from base to gripper for each image
-
-    imgs = np.empty((IMG_NUM, H, W, 3))
-    # TODO: images in rgb
-
-    obj_locs = np.empty((IMG_NUM, OBJ_NUM, 3))
-    # TODO: obj position for each images, each objects
-
-    obj_centers = np.empty((IMG_NUM, OBJ_NUM, 2))
-    obj_phis = np.empty((IMG_NUM, OBJ_NUM))
-    obj_areas = np.empty((IMG_NUM, OBJ_NUM))
-
-    for img_idx in range(IMG_NUM):
-        img = UndistortImage(imgs[img_idx], camera_mat, camera_distort)
-
-        obj_anno = AnnoObjWithColorSim(img, obj_colors)
-
-        for obj_idx in range(OBJ_NUM):
-            obj_points = np.stack(np.where(obj_anno == obj_idx + 1), axis=-1)
-
-            center, phi = FindCL(obj_points) # [2], []
-            area = float(obj_points.shape[0]) # [1]
-
-            obj_centers[img_idx, obj_idx] = center
-            obj_phis[img_idx, obj_idx] = phi
-            obj_areas[img_idx, obj_idx] = area
-
-    obj_Ms = np.empty((OBJ_NUM, 4, 4))
-
-    for obj_idx in range(OBJ_NUM):
-        print(f"obj_idx = {obj_idx}")
-
-        obj_M = GetObjM(
-            Ts_base_to_gripper, # [IMG_NUM, 4, 4]
-            obj_locs[:, obj_idx, :], # [IMG_NUM, 3]
-            obj_centers[:, obj_idx, :], # [IMG_NUM, 2]
-            obj_areas[:, obj_idx], # [IMG_NUM]
-        )
-
-        assert obj_M.shape == (4, 4)
-
-        obj_Ms[obj_idx] = obj_M
-
-        print(f"obj_M =\n{obj_M}")
-
 def Regress():
-    camera_mat, camera_distort = \
-        ReadCameraParam(f"{DIR}/../camera_calib/camera_params.npy")
+    camera_param = NPLoad(f"{DIR}/camera_params.npy")
+    camera_mat = camera_param["camera_mat"]
+    camera_distort = camera_param["camera_distort"]
 
     print(f"camera_mat")
     print(camera_mat)
@@ -456,7 +381,7 @@ def Regress():
     for x in range(x_start, x_start + stride * 4, stride):
         for y in range(y_start, y_start + stride * 4, stride):
             for z in [above_z - stride, above_z]:
-                x_angle = -180
+                x_angle = 180
                 y_angle = 0
                 z_angle = 135
 
@@ -476,34 +401,41 @@ def Regress():
         [118, 156, 208], # blue
     ])
 
+    obj_area_factors = np.array([1, 2, 3])
+
     OBJ_NUM = obj_colors.shape[0]
 
     obj_locs = np.empty((IMG_NUM, OBJ_NUM, 3))
-    obj_locs[:, 0] = [348, 158, 110] # red
-    obj_locs[:, 1] = [360, 319, 135] # blue
-    obj_locs[:, 2] = [171, 374, 110] # yellow
+    obj_locs[:, 0, :] = [348, 158, 110] # red
+    obj_locs[:, 1, :] = [171, 374, 110] # yellow
+    obj_locs[:, 2, :] = [360, 319, 135] # blue
 
     obj_centers = np.empty((IMG_NUM, OBJ_NUM, 2))
     obj_phis = np.empty((IMG_NUM, OBJ_NUM))
     obj_areas = np.empty((IMG_NUM, OBJ_NUM))
 
+    anno_colors = np.concatenate(
+        [[[0, 0, 0]], obj_colors], axis=0).astype(np.uint8)
+
     for img_idx in range(IMG_NUM):
-        print(f"img_idx = {img_idx}")
+        print(f"regress img_idx {img_idx}")
 
         img = UndistortImage(imgs[img_idx], camera_mat, camera_distort)
 
-        cur_obj_founds, cur_obj_centers, cur_obj_phis, cur_obj_areas = \
-            FindObjs(img, obj_colors)
+        obj_anno_map, cur_obj_founds, \
+        cur_obj_centers, cur_obj_phis, cur_obj_areas = FindObjs(img, obj_colors)
         # cur_obj_founds[OBJ_NUM] boolean
         # cur_obj_centers[OBJ_NUM, 2] float
         # cur_obj_phis[OBJ_NUM] float
         # cur_obj_areas[OBJ_NUM] float
 
-        '''
-        cur_obj_centers = cv.undistortPoints(
-            cur_obj_centers, camera_mat, camera_distort, None, camera_mat) \
-            .reshape((OBJ_NUM, 2))
-        '''
+        obj_anno_img = ColorAnnoObjs(anno_colors, obj_anno_map)
+
+        for obj_idx in range(OBJ_NUM):
+            DrawCenterPhi(obj_colors[obj_idx], obj_anno_img,
+                          cur_obj_centers[obj_idx], cur_obj_phis[obj_idx])
+
+        WriteImg(f"{DIR}/obj_anno_img/obj_anno_img_{img_idx}.png", obj_anno_img)
 
         obj_centers[img_idx] = cur_obj_centers
         obj_phis[img_idx] = cur_obj_phis
@@ -529,13 +461,13 @@ def Regress():
 
         print(f"obj_M =\n{obj_M}")
 
-    np.save(f"{DIR}/obj_Ms.npy", {"obj_Ms": obj_Ms})
+    NPSave(f"{DIR}/obj_Ms.npy", {"obj_Ms": obj_Ms})
 
     # --------------------------------------------------------------------------
     # --------------------------------------------------------------------------
     # --------------------------------------------------------------------------
 
-    obj_Ms = ReadObjMs(f"{DIR}/obj_Ms.npy")
+    obj_Ms = NPLoad(f"{DIR}/obj_Ms.npy")["obj_Ms"]
 
     print(obj_Ms)
 
@@ -569,13 +501,17 @@ def Regress():
 
             print(f"obj_phi = {obj_phi * RAD_TO_DEG}")
 
-            err += ((obj_locs[img_idx, obj_idx] - obj_loc)**2).sum()
+            cur_err = ((obj_locs[img_idx, obj_idx] - obj_loc)**2).sum()
+            err += cur_err
+
+            print(f"cur_err = {cur_err}")
 
         print(f"err = {(err / IMG_NUM) ** 0.5}")
 
 def Inference(img, cur_pose):
-    camera_mat, camera_distort = \
-        ReadCameraParam(f"{DIR}/../camera_calib/camera_params.npy")
+    camera_param = NPLoad(f"{DIR}/camera_params.npy")
+    camera_mat = camera_param["camera_mat"]
+    camera_distort = camera_param["camera_distort"]
 
     obj_colors = np.array([
         [247, 189, 170], # red
@@ -585,7 +521,9 @@ def Inference(img, cur_pose):
 
     OBJ_NUM = obj_colors.shape[0]
 
-    obj_Ms = ReadObjMs(f"{DIR}/obj_Ms.npy")
+    obj_Ms = NPLoad(f"{DIR}/obj_Ms.npy")["obj_Ms"]
+
+    print(f"cur_pose = {cur_pose}")
 
     T = np.identity(4)
     T = GetHomoRotMat(1, 0, 0, cur_pose[3] * DEG_TO_RAD) @ T
@@ -597,7 +535,8 @@ def Inference(img, cur_pose):
 
     img = UndistortImage(img, camera_mat, camera_distort)
 
-    obj_founds, obj_centers, obj_phis, obj_areas = FindObjs(img, obj_colors)
+    obj_anno_map, obj_founds, \
+    obj_centers, obj_phis, obj_areas = FindObjs(img, obj_colors)
     # obj_founds[OBJ_NUM] boolean
     # obj_centers[OBJ_NUM, 2] float
     # obj_phis[OBJ_NUM] float
@@ -630,10 +569,19 @@ def Inference(img, cur_pose):
     for obj_idx in range(OBJ_NUM):
         print(f"obj_idx = {obj_idx}")
 
-        obj_phi = obj_phis[obj_idx] + np.pi / 2 + np.pi / 4
+        obj_ang = obj_phis[obj_idx] * RAD_TO_DEG
 
-        while obj_phi < 0:
-            obj_phi += 2 * np.pi
+        if obj_founds[obj_idx]:
+            while obj_ang < 0:
+                obj_ang += 360
+
+            while obj_ang < -90:
+                obj_ang += 180
+
+            while 90 < obj_ang:
+                obj_ang -= 180
+
+        obj_ang += 135
 
         obj_pose = [
             float(obj_locs[obj_idx, 0]),
@@ -641,7 +589,7 @@ def Inference(img, cur_pose):
             float(obj_locs[obj_idx, 2]),
             float(180),
             float(0),
-            float(obj_phi * RAD_TO_DEG),
+            float(obj_ang),
         ]
 
         obj_poses.append(obj_pose)
@@ -651,8 +599,9 @@ def Inference(img, cur_pose):
     return obj_poses
 
 def Test():
-    camera_mat, camera_distort = \
-        ReadCameraParam(f"{DIR}/../camera_calib/camera_params.npy")
+    camera_param = NPLoad(f"{DIR}/camera_params.npy")
+    camera_mat = camera_param["camera_mat"]
+    camera_distort = camera_param["camera_distort"]
 
     print(f"camera_mat")
     print(camera_mat)
@@ -685,7 +634,7 @@ def Test():
     for x in range(x_start, x_start + stride * 4, stride):
         for y in range(y_start, y_start + stride * 4, stride):
             for z in [above_z - stride, above_z]:
-                x_angle = -180
+                x_angle = 180
                 y_angle = 0
                 z_angle = 135
 
@@ -700,9 +649,9 @@ def Test():
     OBJ_NUM = obj_colors.shape[0]
 
     obj_locs = np.empty((IMG_NUM, OBJ_NUM, 3))
-    obj_locs[:, 0] = [348, 158, 110] # red
-    obj_locs[:, 1] = [360, 319, 135] # blue
-    obj_locs[:, 2] = [171, 374, 110] # yellow
+    obj_locs[:, 0, :] = [348, 158, 110] # red
+    obj_locs[:, 1, :] = [171, 374, 110] # yellow
+    obj_locs[:, 2, :] = [360, 319, 135] # blue
 
     for img_idx in range(IMG_NUM):
         obj_poses = Inference(imgs[img_idx], cur_poses[img_idx])
@@ -779,5 +728,12 @@ def Test2():
 
     cv.imwrite(f"{DIR}/anno_img.png", cv.cvtColor(anno_img, cv.COLOR_BGR2RGB))
 
+def KTest():
+    obj_Ms = NPLoad(f"{DIR}/obj_Ms.npy")["obj_Ms"]
+
+    print(obj_Ms)
+
 if __name__ == "__main__":
-    Test()
+    KTest()
+    # Regress()
+    # Test()
